@@ -1,0 +1,8 @@
+id=gh-hugepage-reserve
+name=Gunyah Hugepage Reserve
+version=v4
+versionCode=4
+author=BigfootACA & lateautumn & wasdwasd0105
+description=Kernel module for Gunyah Hugepage Reserve
+updateJson=https://api.classfun.cn/gh-hugepage-reserve/update/
+support=https://github.com/Droid-VM/
