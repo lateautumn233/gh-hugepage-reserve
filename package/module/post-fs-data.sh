@@ -8,6 +8,7 @@ if [ -f "$DIR/disable" ]; then
 fi
 if [ -f "$DIR/stamp" ]; then
 	touch "$DIR/crash"
+	rm -f "$DIR/stamp"
 fi
 if [ -f "$DIR/crash" ]; then
 	touch "$DIR/disable"
