@@ -45,4 +45,7 @@ cp -v module.prop "$DSTDIR/"
 cp -av module/* "$DSTDIR/"
 chmod +x "$DSTDIR/"*.sh
 cp -a "$DSTDIR" "/data/adb/modules/"
+echo
+echo -e "\xe2\x9c\x85 Module installed successfully. Please reboot to take effect."
+echo
 exit 0
