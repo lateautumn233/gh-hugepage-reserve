@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download package zip artifact
+        uses: actions/download-artifact@v7
+        with:
+          path: dl
+          pattern: gh-hugepage-reserve-*
+          merge-multiple: true
+
+      - name: Locate zip
+        id: f
+        run: |
+          set -e
+          zip=$(find dl -name '*.zip' | head -n1)
+          if [ -z "$zip" ]; then
+            echo "::error::no packaged zip found"
+            exit 1
+          fi
+          echo "zip=$zip" >> "$GITHUB_OUTPUT"
+          ls -lh "$zip"
+
+      - name: Publish release (overwrite if exists)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }} (module v${{ needs.build.outputs.ver }})
+          body: |
+            gh_hugepage_reserve release.
+
+            - module version: `${{ needs.build.outputs.ver }}`
+            - tag: `${{ github.ref_name }}`
+            - commit: ${{ github.sha }}
+
+            Flash `gh-hugepage-reserve.zip` in Magisk/KernelSU
+            (per-kernel .ko are inside the zip).
+          files: ${{ steps.f.outputs.zip }}

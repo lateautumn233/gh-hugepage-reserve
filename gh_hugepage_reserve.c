@@ -32,7 +32,7 @@
  *   echo advise > /sys/kernel/mm/transparent_hugepage/shmem_enabled
  *
  * Usage:
- *   insmod gh_hugepage_reserve.ko pool_target=1024 refill_delay_ms=5000
+ *   insmod gh_hugepage_reserve.ko pool_want=1024 refill_delay_ms=5000
  */
 
 #define pr_fmt(fmt) "gh_hugepage_reserve: " fmt
@@ -48,8 +48,16 @@
 #include <linux/delay.h>
 #include <linux/compaction.h>
 #include <linux/sched/mm.h>
+#include <linux/page_ref.h>
+#include <linux/topology.h>
+#include <linux/nodemask.h>
 
 #define POOL_SIZE_MAX		4096
+#define ACQUIRE_MAX_FAILS	8	/* stop once the cumulative fail score reaches
+					 * this (a failure +1, a success -3, floored
+					 * at 0) */
+#define ACQUIRE_FAIL_DECAY	3	/* a success drops the fail score by this */
+#define ACQUIRE_DELAY_MS	10	/* breathe between migrations */
 #define PAGE_ORDER		9	/* 2^9 * 4KB = 2MB */
 #define REFILL_DELAY_MS_DEFAULT	5000
 #define REFILL_RETRY_MAX	3
@@ -61,9 +69,8 @@
 
 /* ---- Module parameters ---- */
 
-static int pool_target = 1024;
-module_param(pool_target, int, 0444);
-MODULE_PARM_DESC(pool_target, "Number of 2MB pages to pre-allocate (default 1024)");
+/* pool_want is the single target knob (declared below): set at insmod and at
+ * runtime via the same sysfs file. */
 
 static int refill_delay_ms = REFILL_DELAY_MS_DEFAULT;
 module_param(refill_delay_ms, int, 0644);
@@ -74,7 +81,14 @@ MODULE_PARM_DESC(refill_delay_ms,
 
 static struct page *page_pool[POOL_SIZE_MAX];
 static atomic_t pool_count = ATOMIC_INIT(0);
-static int pool_total;
+static int pool_total;	/* current CAPACITY: pages we actually hold now.
+			 * The free-hook/refill only ever chase this, so it must
+			 * never exceed what we've actually obtained - otherwise
+			 * the hook would perpetually steal system order-9 frees. */
+static int pool_want = 1024;	/* the single TARGET knob: set at insmod and at
+				 * runtime via the pool_want sysfs. init allocates
+				 * toward it; acquire raises capacity toward it. */
+static bool pool_ready;		/* true once module_init has built the pool */
 static DEFINE_RAW_SPINLOCK(pool_lock);
 
 /* Per-CPU guard: prevent free_pages_kp from reclaiming pages freed by ret_handler */
@@ -108,7 +122,20 @@ static atomic_t total_refilled = ATOMIC_INIT(0);
  * to avoid serving pool pages to unrelated order-9 allocations.
  */
 #define VM_OWNER_MAX	8
-static struct mm_struct *vm_owner_mms[VM_OWNER_MAX];
+
+/*
+ * One tracked Gunyah VM owner. tgid/comm are captured at GH_CREATE_VM time
+ * so userspace can attribute pool pages to a concrete process (and, in the
+ * app, to a VM). served counts the pool pages actually handed to this owner.
+ */
+struct vm_owner {
+	struct mm_struct *mm;
+	pid_t		  tgid;
+	char		  comm[TASK_COMM_LEN];
+	atomic_t	  served;
+};
+
+static struct vm_owner vm_owners[VM_OWNER_MAX];
 static atomic_t vm_owner_count = ATOMIC_INIT(0);
 static DEFINE_SPINLOCK(vm_owner_lock);
 
@@ -121,15 +148,19 @@ static void vm_owner_add(struct mm_struct *mm)
 	count = atomic_read(&vm_owner_count);
 
 	for (i = 0; i < count; i++) {
-		if (vm_owner_mms[i] == mm)
+		if (vm_owners[i].mm == mm)
 			goto out;
 	}
 	if (count < VM_OWNER_MAX) {
 		mmgrab(mm);
-		vm_owner_mms[count] = mm;
+		vm_owners[count].mm = mm;
+		vm_owners[count].tgid = current->tgid;
+		strscpy(vm_owners[count].comm, current->comm,
+			sizeof(vm_owners[count].comm));
+		atomic_set(&vm_owners[count].served, 0);
 		smp_store_release(&vm_owner_count.counter, count + 1);
-		pr_info("tracking VM owner mm=%px (comm=%s)\n",
-			mm, current->comm);
+		pr_info("tracking VM owner mm=%px pid=%d (comm=%s)\n",
+			mm, current->tgid, current->comm);
 	} else {
 		pr_warn("too many VM owners (%d), ignoring %s\n",
 			VM_OWNER_MAX, current->comm);
@@ -144,10 +175,210 @@ static bool vm_owner_contains(struct mm_struct *mm)
 
 	count = smp_load_acquire(&vm_owner_count.counter);
 	for (i = 0; i < count; i++) {
-		if (READ_ONCE(vm_owner_mms[i]) == mm)
+		if (READ_ONCE(vm_owners[i].mm) == mm)
 			return true;
 	}
 	return false;
+}
+
+/* Charge a served pool page to the owner matching @mm (best-effort). */
+static void vm_owner_served_inc(struct mm_struct *mm)
+{
+	int i, count;
+
+	count = smp_load_acquire(&vm_owner_count.counter);
+	for (i = 0; i < count; i++) {
+		if (READ_ONCE(vm_owners[i].mm) == mm) {
+			atomic_inc(&vm_owners[i].served);
+			return;
+		}
+	}
+}
+
+/* ================================================================== */
+/*  Served-page table                                                  */
+/*                                                                     */
+/*  Records every pool page handed to a guest (pfn -> owner tgid) so   */
+/*  outstanding pages can be *located/attributed*, not just counted.   */
+/*  Maintained from atomic probe context -> fully preallocated, no     */
+/*  allocation on the hot path (chaining hash over a node freelist).   */
+/*  Bounded: outstanding pages <= pool_total, so SERVED_MAX is plenty. */
+/* ================================================================== */
+
+#define SERVED_MAX	8192U		/* power of two */
+#define SERVED_NULL	0xFFFFU
+
+struct served_node {
+	unsigned long	pfn;
+	pid_t		tgid;
+	u16		next;		/* freelist or bucket chain index */
+};
+
+static struct served_node served_nodes[SERVED_MAX];
+static u16  served_bucket[SERVED_MAX];
+static u16  served_free_head;
+static int  served_count;
+static int  served_overflow;
+static DEFINE_RAW_SPINLOCK(served_lock);
+
+/* Last reconcile result + per-owner live tallies (guarded by recon_mutex). */
+static DEFINE_MUTEX(recon_mutex);
+static int   recon_live, recon_orphan_freed, recon_orphan_inuse;
+static int   recon_owner_n;
+static pid_t recon_owner_tgid[VM_OWNER_MAX];
+static char  recon_owner_comm[VM_OWNER_MAX][TASK_COMM_LEN];
+static long  recon_owner_pages[VM_OWNER_MAX];
+
+static void served_init(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < SERVED_MAX; i++) {
+		served_nodes[i].next = (i + 1 < SERVED_MAX) ? (u16)(i + 1) : SERVED_NULL;
+		served_bucket[i] = SERVED_NULL;
+	}
+	served_free_head = 0;
+	served_count = 0;
+	served_overflow = 0;
+}
+
+static inline unsigned int served_hash(unsigned long pfn)
+{
+	return (unsigned int)(pfn >> PAGE_ORDER) & (SERVED_MAX - 1);
+}
+
+static void served_add(unsigned long pfn, pid_t tgid)
+{
+	unsigned long flags;
+	unsigned int b;
+	u16 n, idx;
+
+	raw_spin_lock_irqsave(&served_lock, flags);
+	b = served_hash(pfn);
+	for (n = served_bucket[b]; n != SERVED_NULL; n = served_nodes[n].next) {
+		if (served_nodes[n].pfn == pfn) {
+			served_nodes[n].tgid = tgid;	/* re-served: update owner */
+			goto out;
+		}
+	}
+	if (served_free_head == SERVED_NULL) {
+		served_overflow++;
+		goto out;
+	}
+	idx = served_free_head;
+	served_free_head = served_nodes[idx].next;
+	served_nodes[idx].pfn = pfn;
+	served_nodes[idx].tgid = tgid;
+	served_nodes[idx].next = served_bucket[b];
+	served_bucket[b] = idx;
+	served_count++;
+out:
+	raw_spin_unlock_irqrestore(&served_lock, flags);
+}
+
+static void served_del(unsigned long pfn)
+{
+	unsigned long flags;
+	unsigned int b;
+	u16 n, prev = SERVED_NULL;
+
+	raw_spin_lock_irqsave(&served_lock, flags);
+	b = served_hash(pfn);
+	for (n = served_bucket[b]; n != SERVED_NULL;
+	     prev = n, n = served_nodes[n].next) {
+		if (served_nodes[n].pfn == pfn) {
+			if (prev == SERVED_NULL)
+				served_bucket[b] = served_nodes[n].next;
+			else
+				served_nodes[prev].next = served_nodes[n].next;
+			served_nodes[n].next = served_free_head;
+			served_free_head = n;
+			served_count--;
+			break;
+		}
+	}
+	raw_spin_unlock_irqrestore(&served_lock, flags);
+}
+
+/*
+ * Reconcile (process context only): drop every tracked page whose owner is no
+ * longer a currently-tracked VM owner. Each dropped (orphan) page is classified
+ * by whether its refcount is now 0 (returned to the system) or not (reused
+ * elsewhere). Surviving entries are tallied per live owner.
+ */
+static void served_do_reconcile(void)
+{
+	unsigned long flags;
+	pid_t live_tgid[VM_OWNER_MAX];
+	char  live_comm[VM_OWNER_MAX][TASK_COMM_LEN];
+	long  live_pages[VM_OWNER_MAX];
+	int   live_n, i, b;
+	int   live = 0, of = 0, oi = 0;
+
+	spin_lock_irqsave(&vm_owner_lock, flags);
+	live_n = atomic_read(&vm_owner_count);
+	if (live_n > VM_OWNER_MAX)
+		live_n = VM_OWNER_MAX;
+	for (i = 0; i < live_n; i++) {
+		live_tgid[i] = vm_owners[i].tgid;
+		strscpy(live_comm[i], vm_owners[i].comm, TASK_COMM_LEN);
+		live_pages[i] = 0;
+	}
+	spin_unlock_irqrestore(&vm_owner_lock, flags);
+
+	raw_spin_lock_irqsave(&served_lock, flags);
+	for (b = 0; b < SERVED_MAX; b++) {
+		u16 prev = SERVED_NULL, n = served_bucket[b];
+
+		while (n != SERVED_NULL) {
+			int owner = -1;
+			u16 nx;
+
+			for (i = 0; i < live_n; i++) {
+				if (live_tgid[i] == served_nodes[n].tgid) {
+					owner = i;
+					break;
+				}
+			}
+			if (owner >= 0) {
+				live++;
+				live_pages[owner]++;
+				prev = n;
+				n = served_nodes[n].next;
+				continue;
+			}
+			/* orphan: owner is no longer a tracked VM */
+			{
+				unsigned long pfn = served_nodes[n].pfn;
+				struct page *pg = pfn_valid(pfn) ? pfn_to_page(pfn) : NULL;
+
+				if (pg && page_count(pg) == 0)
+					of++;
+				else
+					oi++;
+			}
+			nx = served_nodes[n].next;
+			if (prev == SERVED_NULL)
+				served_bucket[b] = nx;
+			else
+				served_nodes[prev].next = nx;
+			served_nodes[n].next = served_free_head;
+			served_free_head = n;
+			served_count--;
+			n = nx;
+		}
+	}
+	raw_spin_unlock_irqrestore(&served_lock, flags);
+
+	recon_live = live;
+	recon_orphan_freed = of;
+	recon_orphan_inuse = oi;
+	recon_owner_n = live_n;
+	for (i = 0; i < live_n; i++) {
+		recon_owner_tgid[i] = live_tgid[i];
+		strscpy(recon_owner_comm[i], live_comm[i], TASK_COMM_LEN);
+		recon_owner_pages[i] = live_pages[i];
+	}
 }
 
 /* ---- Work and probe structs ---- */
@@ -158,6 +389,16 @@ static struct kretprobe kretp;
 static struct kprobe vm_detect_kp;
 static struct kprobe vm_destroy_kp;
 static struct kprobe free_pages_kp;
+
+/* ---- Aggressive acquire (GUI-only): alloc_contig_pages migrates to build
+ *      2MB blocks even under fragmentation. alloc_contig_pages isn't exported,
+ *      so resolve it via a kprobe at init. prep_compound_page is EXPORT_GPL. */
+static struct work_struct acquire_work;
+static atomic_t acquire_running = ATOMIC_INIT(0);
+static struct page *(*p_alloc_contig_pages)(unsigned long nr_pages,
+		gfp_t gfp_mask, int nid, nodemask_t *nodemask);
+/* EXPORT_SYMBOL_GPL in mm/page_alloc.c but not in a public header */
+extern void prep_compound_page(struct page *page, unsigned int order);
 
 /* ================================================================== */
 /*  Pool push/pop (protected by pool_lock)                            */
@@ -197,6 +438,30 @@ static bool pool_push(struct page *page)
 	return ok;
 }
 
+/*
+ * Append a freshly *acquired* page and grow CAPACITY (pool_total) up to it.
+ * Used only by the acquire path (real new allocations proven to succeed),
+ * never by the free-hook - so capacity only rises by what we genuinely got.
+ */
+static bool pool_push_grow(struct page *page)
+{
+	unsigned long flags;
+	int idx;
+	bool ok;
+
+	raw_spin_lock_irqsave(&pool_lock, flags);
+	idx = atomic_read(&pool_count);
+	ok = (idx < POOL_SIZE_MAX);
+	if (ok) {
+		page_pool[idx] = page;
+		atomic_set(&pool_count, idx + 1);
+		if (idx + 1 > pool_total)
+			WRITE_ONCE(pool_total, idx + 1);
+	}
+	raw_spin_unlock_irqrestore(&pool_lock, flags);
+	return ok;
+}
+
 /* ================================================================== */
 /*  kprobe on __free_pages - page reclamation                         */
 /* ================================================================== */
@@ -209,13 +474,19 @@ static int free_pages_pre_handler(struct kprobe *p, struct pt_regs *regs)
 	order = (unsigned int)regs_get_kernel_argument(regs, 1);
 	if (order != PAGE_ORDER)
 		return 0;
+
+	/* A served pool page is being freed: drop it from the table regardless
+	 * of whether we end up reclaiming it back into the pool below. */
+	page = (struct page *)regs_get_kernel_argument(regs, 0);
+	if (page)
+		served_del(page_to_pfn(page));
+
 	if (atomic_read(&pool_count) >= pool_total)
 		return 0;
 	/* Avoid reclaiming pages freed by our ret_handler */
 	if (this_cpu_read(in_ret_handler))
 		return 0;
 
-	page = (struct page *)regs_get_kernel_argument(regs, 0);
 	if (!page || !PageCompound(page))
 		return 0;
 
@@ -265,6 +536,9 @@ static int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 	orig = (struct page *)regs_return_value(regs);
 	regs_set_return_value(regs, (unsigned long)pool_page);
 	atomic_inc(&total_served);
+	if (current->mm)
+		vm_owner_served_inc(current->mm);
+	served_add(page_to_pfn(pool_page), current->tgid);
 	pr_info_ratelimited("served page, %d left\n",
 			    atomic_read(&pool_count));
 
@@ -372,8 +646,11 @@ static void vm_owner_release_worker(struct work_struct *work)
 	spin_lock_irqsave(&vm_owner_lock, flags);
 	count = atomic_read(&vm_owner_count);
 	for (i = 0; i < count; i++) {
-		to_drop[i] = vm_owner_mms[i];
-		vm_owner_mms[i] = NULL;
+		to_drop[i] = vm_owners[i].mm;
+		vm_owners[i].mm = NULL;
+		vm_owners[i].tgid = 0;
+		vm_owners[i].comm[0] = '\0';
+		atomic_set(&vm_owners[i].served, 0);
 	}
 	atomic_set(&vm_owner_count, 0);
 	spin_unlock_irqrestore(&vm_owner_lock, flags);
@@ -418,7 +695,7 @@ static void refill_worker(struct work_struct *work)
 				exited = true;
 			} else {
 				for (i = 0; i < count; i++) {
-					struct mm_struct *mm = READ_ONCE(vm_owner_mms[i]);
+					struct mm_struct *mm = READ_ONCE(vm_owners[i].mm);
 
 					if (mm && atomic_read(&mm->mm_users) == 0) {
 						exited = true;
@@ -564,9 +841,14 @@ static int refill_stat_get(char *buf, const struct kernel_param *kp)
 	n += sysfs_emit_at(buf, n, "state=%s\n", state_names[state]);
 	n += sysfs_emit_at(buf, n, "pool_avail=%d\n", atomic_read(&pool_count));
 	n += sysfs_emit_at(buf, n, "pool_total=%d\n", pool_total);
+	/* Live served-out (lent to VMs) count. owned+traced = pool_avail + served;
+	 * this can exceed pool_total after a shrink that left served pages out. */
+	n += sysfs_emit_at(buf, n, "served=%d\n", served_count);
+	n += sysfs_emit_at(buf, n, "pool_want=%d\n", READ_ONCE(pool_want));
 	n += sysfs_emit_at(buf, n, "total_served=%d\n", atomic_read(&total_served));
 	n += sysfs_emit_at(buf, n, "total_refilled=%d\n", atomic_read(&total_refilled));
 	n += sysfs_emit_at(buf, n, "active_vms=%d\n", max(atomic_read(&vm_active_count), 0));
+	n += sysfs_emit_at(buf, n, "acquire_active=%d\n", atomic_read(&acquire_running));
 
 	return n;
 }
@@ -576,6 +858,79 @@ static const struct kernel_param_ops refill_stat_ops = {
 };
 module_param_cb(refill_stat, &refill_stat_ops, NULL, 0444);
 MODULE_PARM_DESC(refill_stat, "Refill status and statistics (read-only)");
+
+/* vm_owners: read-only per-VM-owner attribution */
+static int vm_owners_get(char *buf, const struct kernel_param *kp)
+{
+	unsigned long flags;
+	int i, count, n = 0;
+
+	spin_lock_irqsave(&vm_owner_lock, flags);
+	count = atomic_read(&vm_owner_count);
+	for (i = 0; i < count; i++) {
+		if (!vm_owners[i].mm)
+			continue;
+		/* comm is emitted last so userspace can keep spaces in it */
+		n += sysfs_emit_at(buf, n, "pid=%d served=%d comm=%s\n",
+				   vm_owners[i].tgid,
+				   atomic_read(&vm_owners[i].served),
+				   vm_owners[i].comm);
+	}
+	spin_unlock_irqrestore(&vm_owner_lock, flags);
+	return n;
+}
+
+static const struct kernel_param_ops vm_owners_ops = {
+	.get = vm_owners_get,
+};
+module_param_cb(vm_owners, &vm_owners_ops, NULL, 0444);
+MODULE_PARM_DESC(vm_owners,
+	"Per-VM-owner attribution: pid/served-pages/comm (read-only)");
+
+/* reconcile: write 1 to reconcile the served-page table (process context) */
+static int reconcile_set(const char *val, const struct kernel_param *kp)
+{
+	int v;
+
+	if (kstrtoint(val, 10, &v) || v != 1)
+		return -EINVAL;
+	mutex_lock(&recon_mutex);
+	served_do_reconcile();
+	mutex_unlock(&recon_mutex);
+	return 0;
+}
+
+static const struct kernel_param_ops reconcile_ops = {
+	.set = reconcile_set,
+};
+module_param_cb(reconcile, &reconcile_ops, NULL, 0200);
+MODULE_PARM_DESC(reconcile, "Write 1 to reconcile the served-page table");
+
+/* served_summary: read-only reconciled view of the served-page table */
+static int served_summary_get(char *buf, const struct kernel_param *kp)
+{
+	int n = 0, i;
+
+	mutex_lock(&recon_mutex);
+	n += sysfs_emit_at(buf, n, "tracked=%d\n", READ_ONCE(served_count));
+	n += sysfs_emit_at(buf, n, "overflow=%d\n", READ_ONCE(served_overflow));
+	n += sysfs_emit_at(buf, n, "live=%d\n", recon_live);
+	n += sysfs_emit_at(buf, n, "orphan_freed=%d\n", recon_orphan_freed);
+	n += sysfs_emit_at(buf, n, "orphan_inuse=%d\n", recon_orphan_inuse);
+	for (i = 0; i < recon_owner_n; i++)
+		n += sysfs_emit_at(buf, n, "owner pid=%d pages=%ld comm=%s\n",
+				   recon_owner_tgid[i], recon_owner_pages[i],
+				   recon_owner_comm[i]);
+	mutex_unlock(&recon_mutex);
+	return n;
+}
+
+static const struct kernel_param_ops served_summary_ops = {
+	.get = served_summary_get,
+};
+module_param_cb(served_summary, &served_summary_ops, NULL, 0444);
+MODULE_PARM_DESC(served_summary,
+	"Reconciled served-page table summary (read-only)");
 
 /* manual_refill: write 1 to trigger manual refill */
 static int manual_refill_set(const char *val, const struct kernel_param *kp)
@@ -606,6 +961,243 @@ static const struct kernel_param_ops manual_refill_ops = {
 module_param_cb(manual_refill, &manual_refill_ops, NULL, 0200);
 MODULE_PARM_DESC(manual_refill, "Write 1 to trigger manual pool refill");
 
+/*
+ * pool_do_resize: change the target (pool_want).
+ *   shrink (new < capacity): free the excess pooled pages immediately.
+ *   grow   (new > capacity): raise the target only; new pages are NOT
+ *                            allocated here - use acquire to fill.
+ */
+static void pool_do_resize(int newt)
+{
+	struct page *batch[32];
+	int target_avail;
+
+	/*
+	 * Clamp only to the array bounds. A target below the currently lent-out
+	 * count is allowed and safe: shrink frees only pooled pages, and when the
+	 * lent pages are later returned the free-hook sees pool_count >= pool_total
+	 * and lets them go to buddy instead of re-pooling - no overflow, no leak.
+	 */
+	if (newt < 1)
+		newt = 1;
+	if (newt > POOL_SIZE_MAX)
+		newt = POOL_SIZE_MAX;
+
+	WRITE_ONCE(pool_want, newt);
+
+	/*
+	 * The real reserve held is owned+traced = pool_count(avail) + served. GROW
+	 * stops here: nothing to free, pool_total is left for acquire/free-hook to
+	 * raise as pages come in.
+	 */
+	if (atomic_read(&pool_count) + served_count <= newt)
+		return;
+
+	/*
+	 * SHRINK: free available pages so owned+traced drops to newt. Served pages
+	 * can't be freed (VMs hold them), so the floor is target_avail =
+	 * max(0, newt - served). Set pool_total to that floor *first* so the
+	 * free-hook (which reclaims a freed order-9 page whenever
+	 * pool_count < pool_total) skips the pages we drain here - pool_count stays
+	 * >= target_avail throughout. Restore pool_total = newt afterwards so the
+	 * hook can re-pool VM-returned pages back up to the new target.
+	 */
+	target_avail = newt - served_count;
+	if (target_avail < 0)
+		target_avail = 0;
+	WRITE_ONCE(pool_total, target_avail);
+
+	/* free outside the lock to avoid the page allocator under it. */
+	for (;;) {
+		unsigned long flags;
+		int n = 0, i;
+
+		raw_spin_lock_irqsave(&pool_lock, flags);
+		while (n < 32 && atomic_read(&pool_count) > target_avail) {
+			int idx = atomic_read(&pool_count) - 1;
+
+			batch[n++] = page_pool[idx];
+			page_pool[idx] = NULL;
+			atomic_set(&pool_count, idx);
+		}
+		raw_spin_unlock_irqrestore(&pool_lock, flags);
+
+		for (i = 0; i < n; i++)
+			__free_pages(batch[i], PAGE_ORDER);
+		if (n == 0)
+			break;
+	}
+
+	WRITE_ONCE(pool_total, newt);
+	pr_info("pool shrink: want=%d avail=%d served=%d\n",
+		newt, atomic_read(&pool_count), served_count);
+}
+
+/*
+ * pool_want: the single target knob. Settable at insmod and at runtime via the
+ * same file. At insmod (before the pool is built) we just record the value;
+ * after init, a write resizes live (shrink frees now, grow raises target).
+ */
+static int pool_want_set(const char *val, const struct kernel_param *kp)
+{
+	int v;
+
+	if (kstrtoint(val, 10, &v))
+		return -EINVAL;
+	if (v < 1)
+		v = 1;
+	if (v > POOL_SIZE_MAX)
+		v = POOL_SIZE_MAX;
+
+	if (!READ_ONCE(pool_ready)) {
+		WRITE_ONCE(pool_want, v);	/* boot: init will allocate toward it */
+	} else if (atomic_read(&acquire_running)) {
+		/*
+		 * Refuse to resize while the acquire worker runs: it is migrating
+		 * pages *into* the pool, and a concurrent resize would race it over
+		 * pool_total/pool_count/page_pool[]. Keep it simple and lock-free by
+		 * requiring the module to be quiescent first - write 0 to 'acquire'
+		 * to interrupt the worker, then set pool_want once it has stopped.
+		 */
+		return -EBUSY;
+	} else {
+		pool_do_resize(v);		/* runtime: live resize */
+	}
+	return 0;
+}
+
+static int pool_want_get(char *buf, const struct kernel_param *kp)
+{
+	return sysfs_emit(buf, "%d\n", READ_ONCE(pool_want));
+}
+
+static const struct kernel_param_ops pool_want_ops = {
+	.set = pool_want_set,
+	.get = pool_want_get,
+};
+module_param_cb(pool_want, &pool_want_ops, NULL, 0644);
+MODULE_PARM_DESC(pool_want,
+	"Target pages (insmod + runtime): grow raises target, shrink frees now");
+
+/* ================================================================== */
+/*  Aggressive acquire (GUI-only)                                      */
+/* ================================================================== */
+
+/* Resolve a non-exported symbol via a throwaway kprobe (module already uses
+ * kprobes). Returns NULL if the symbol is absent. */
+static void *resolve_kfunc(const char *name)
+{
+	struct kprobe kp = { .symbol_name = name };
+	void *addr = NULL;
+
+	if (register_kprobe(&kp) == 0) {
+		addr = (void *)kp.addr;
+		unregister_kprobe(&kp);
+	}
+	return addr;
+}
+
+/*
+ * Fill the pool toward pool_want using alloc_contig_pages(), which *migrates*
+ * movable pages to assemble 2MB blocks even when the buddy allocator has none.
+ * Heavy (migration) but only ever run from the GUI button, never at boot, so a
+ * worst-case stall/abort is reboot-recoverable and can't bootloop.
+ *
+ * alloc_contig_pages returns nr_pages individual refcount-1 pages; turn the
+ * range into one order-9 compound page (prep_compound_page sets structure,
+ * then zero the tail refcounts) so it is indistinguishable from an
+ * alloc_pages(__GFP_COMP) page for serving and for __free_pages on release.
+ */
+static void acquire_worker(struct work_struct *w)
+{
+	const int nr = 1 << PAGE_ORDER;
+	int got = 0, fail_score = 0, i;
+
+	if (!p_alloc_contig_pages)
+		goto out;
+
+	/*
+	 * Fill until the reserve (available + served-out) reaches pool_want, so
+	 * pages already lent to VMs count toward the target. Exit when:
+	 *   - acquire_running is cleared (GUI wrote 0 to interrupt - pool_want is
+	 *     left intact so the remaining deficit still shows as "waiting"), or
+	 *   - the cumulative fail score reaches ACQUIRE_MAX_FAILS (each migration
+	 *     failure adds 1, each success subtracts ACQUIRE_FAIL_DECAY, floored
+	 *     at 0), the normal "system can't migrate any more" give-up.
+	 * msleep throttles CPU.
+	 */
+	while (atomic_read(&acquire_running) &&
+	       atomic_read(&pool_count) + served_count < READ_ONCE(pool_want) &&
+	       fail_score < ACQUIRE_MAX_FAILS) {
+		struct page *p = p_alloc_contig_pages(nr,
+				GFP_KERNEL | __GFP_NOWARN, numa_node_id(), NULL);
+
+		if (!p) {
+			fail_score++;
+			msleep(ACQUIRE_DELAY_MS);
+			continue;
+		}
+		fail_score -= ACQUIRE_FAIL_DECAY;
+		if (fail_score < 0)
+			fail_score = 0;
+
+		prep_compound_page(p, PAGE_ORDER);
+		for (i = 1; i < nr; i++)
+			set_page_count(p + i, 0);	/* tails: 1 -> 0 */
+
+		if (!pool_push_grow(p)) {
+			__free_pages(p, PAGE_ORDER);
+			break;			/* pool array full */
+		}
+		atomic_inc(&total_refilled);
+		got++;
+		msleep(ACQUIRE_DELAY_MS);	/* let the system breathe */
+	}
+
+	pr_info("acquire done: +%d pages, avail=%d capacity=%d want=%d\n",
+		got, atomic_read(&pool_count), pool_total, READ_ONCE(pool_want));
+out:
+	atomic_set(&acquire_running, 0);
+}
+
+/* acquire: write 1 to start filling toward pool_want, 0 to interrupt. */
+static int acquire_set(const char *val, const struct kernel_param *kp)
+{
+	int v;
+
+	if (kstrtoint(val, 10, &v) || (v != 0 && v != 1))
+		return -EINVAL;
+	if (v == 0) {
+		/* Interrupt: the worker exits at its next check; pool_want stays. */
+		atomic_set(&acquire_running, 0);
+		return 0;
+	}
+	if (!p_alloc_contig_pages)
+		return -ENOSYS;
+	/* Nothing to do if the reserve (available + served) already meets want. */
+	if (atomic_read(&pool_count) + served_count >= READ_ONCE(pool_want))
+		return 0;
+	if (atomic_cmpxchg(&acquire_running, 0, 1) != 0)
+		return -EBUSY;
+	/*
+	 * Fire-and-return: the heavy migration runs in the kworker and the write
+	 * comes back immediately. Blocking here would hold the per-module param
+	 * mutex for the whole acquire, stalling every other get/set (refill_stat
+	 * polling, etc.) and the GUI. Instead the worker sets acquire_running=0
+	 * when done; userspace polls refill_stat's acquire_active to watch live
+	 * progress and detect completion.
+	 */
+	schedule_work(&acquire_work);
+	return 0;
+}
+
+static const struct kernel_param_ops acquire_ops = {
+	.set = acquire_set,
+};
+module_param_cb(acquire, &acquire_ops, NULL, 0200);
+MODULE_PARM_DESC(acquire,
+	"Write 1 to acquire (migrate) pages toward pool_want, 0 to interrupt");
+
 /* ================================================================== */
 /*  Module init / exit                                                */
 /* ================================================================== */
@@ -614,17 +1206,24 @@ static int __init hugepage_reserve_init(void)
 {
 	int i, ret;
 
-	if (pool_target < 1 || pool_target > POOL_SIZE_MAX)
-		pool_target = 1024;
+	if (pool_want < 1 || pool_want > POOL_SIZE_MAX)
+		pool_want = 1024;
 
 	if (refill_delay_ms < 1000)
 		refill_delay_ms = 1000;
 
-	pr_info("allocating %d x 2MB = %d MB\n",
-		pool_target, pool_target * 2);
+	pr_info("allocating up to %d x 2MB = %d MB\n",
+		pool_want, pool_want * 2);
 
 	INIT_WORK(&vm_owner_release_work, vm_owner_release_worker);
 	INIT_DELAYED_WORK(&refill_work, refill_worker);
+	INIT_WORK(&acquire_work, acquire_worker);
+	served_init();
+
+	/* Resolve the non-exported aggressive allocator (optional feature). */
+	p_alloc_contig_pages = resolve_kfunc("alloc_contig_pages");
+	if (!p_alloc_contig_pages)
+		pr_warn("alloc_contig_pages not found; aggressive acquire disabled\n");
 
 	/* Prepare kretprobe struct */
 	kretp.handler       = ret_handler;
@@ -632,25 +1231,27 @@ static int __init hugepage_reserve_init(void)
 	kretp.data_size     = 0;
 	kretp.maxactive     = 20;
 
-	/* Pre-allocate order-9 compound pages */
-	for (i = 0; i < pool_target; i++) {
+	/* Pre-allocate order-9 compound pages toward the target (give up per-page
+	 * when even compaction/reclaim can't produce one; never OOM-kills). */
+	for (i = 0; i < pool_want; i++) {
 		page_pool[i] = alloc_pages(GFP_KERNEL | __GFP_COMP |
 					   __GFP_NOWARN | __GFP_RETRY_MAYFAIL,
 					   PAGE_ORDER);
 		if (!page_pool[i]) {
 			pr_info("stopped at %d/%d\n",
-				i, pool_target);
+				i, pool_want);
 			break;
 		}
 		if ((i + 1) % 50 == 0) {
 			cond_resched();
 			if ((i + 1) % 100 == 0)
 				pr_info("allocated %d/%d ...\n",
-					i + 1, pool_target);
+					i + 1, pool_want);
 		}
 	}
 
-	pool_total = i;
+	pool_total = i;			/* capacity = what we actually got */
+	/* pool_want stays = the requested target (may exceed capacity) */
 	atomic_set(&pool_count, pool_total);
 
 	if (pool_total == 0) {
@@ -658,8 +1259,11 @@ static int __init hugepage_reserve_init(void)
 		return -ENOMEM;
 	}
 
-	pr_info("pool ready: %d x 2MB = %d MB\n",
-		pool_total, pool_total * 2);
+	pr_info("pool ready: %d x 2MB = %d MB (target %d)\n",
+		pool_total, pool_total * 2, pool_want);
+
+	/* From here, pool_want writes resize live instead of just recording. */
+	WRITE_ONCE(pool_ready, true);
 
 	/*
 	 * Register kretprobe at init - must be active before any VM ioctl.
@@ -749,8 +1353,12 @@ static void __exit hugepage_reserve_exit(void)
 {
 	int i, remaining;
 
+	/* Stop live resizes racing with teardown */
+	WRITE_ONCE(pool_ready, false);
+
 	/* Cancel all pending work */
 	cancel_work_sync(&vm_owner_release_work);
+	cancel_work_sync(&acquire_work);
 	cancel_delayed_work_sync(&refill_work);
 
 	/* Remove all probes */
@@ -773,8 +1381,8 @@ static void __exit hugepage_reserve_exit(void)
 		int j, count = atomic_read(&vm_owner_count);
 
 		for (j = 0; j < count; j++) {
-			if (vm_owner_mms[j])
-				mmdrop(vm_owner_mms[j]);
+			if (vm_owners[j].mm)
+				mmdrop(vm_owners[j].mm);
 		}
 		atomic_set(&vm_owner_count, 0);
 	}

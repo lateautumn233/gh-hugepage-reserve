@@ -20,9 +20,10 @@ if [ -f "$DIR/crash" ]; then
 fi
 touch "$DIR/stamp"
 if ! [ -f "$DIR/settings.prop" ]; then
-	echo "pool_target=1024" > "$DIR/settings.prop"
+	echo "pool_want=1024" > "$DIR/settings.prop"
 fi
 source "$DIR/settings.prop"
 dmesg -w &> "$DIR/dmesg.log" &
-insmod "$DIR/gh_hugepage_reserve.ko" pool_target="$pool_target"
+# Accept legacy pool_target= settings.prop for backward compatibility.
+insmod "$DIR/gh_hugepage_reserve.ko" pool_want="${pool_want:-${pool_target:-1024}}"
 exit 0

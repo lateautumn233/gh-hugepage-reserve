@@ -1,0 +1,104 @@
+name: Build
+
+on:
+  push:
+    branches: [ master, main ]
+    paths:
+      - '*.c'
+      - 'docker_exec.sh'
+      - 'build.sh'
+      - 'package/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+  workflow_call:
+    outputs:
+      ver:
+        description: "module version from package/module.prop"
+        value: ${{ jobs.package.outputs.ver }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.tag }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tag:
+          - android12-5.10
+          - android13-5.10
+          - android13-5.15
+          - android14-5.15
+          - android14-6.1
+          - android15-6.6
+          - android16-6.12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build .ko for ${{ matrix.tag }}
+        run: |
+          set -e
+          OUT="$PWD/package/ko/gh_hugepage_reserve"
+          mkdir -p "$OUT"
+          docker run --rm \
+            -v "$PWD:/src:ro" \
+            -v "$OUT:/out_gh_hugepage_reserve" \
+            "ghcr.io/ylarod/ddk-min:${{ matrix.tag }}" \
+            sh /src/docker_exec.sh gh_hugepage_reserve.c:gh_hugepage_reserve
+
+      - name: Upload .ko artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ko-${{ matrix.tag }}
+          path: package/ko/gh_hugepage_reserve/${{ matrix.tag }}.ko
+          if-no-files-found: ignore
+
+  package:
+    name: Package zip
+    needs: build
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    outputs:
+      ver: ${{ steps.pkg.outputs.ver }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download built .ko artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+          pattern: ko-*
+          merge-multiple: false
+
+      - name: Assemble package + zip
+        id: pkg
+        run: |
+          set -e
+          OUT="package/ko/gh_hugepage_reserve"
+          mkdir -p "$OUT"
+          # Flatten downloaded artifacts (artifacts/ko-<tag>/<tag>.ko) into the package.
+          find artifacts -name '*.ko' -exec cp -v {} "$OUT"/ \;
+          echo "=== built modules ==="
+          ls -lh "$OUT" || true
+          count=$(find "$OUT" -name '*.ko' | wc -l)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::no .ko built for any kernel tag"
+            exit 1
+          fi
+          ver=$(grep -E '^version=' package/module.prop | cut -d= -f2)
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          ( cd package && zip -r "../gh-hugepage-reserve-$ver.zip" . )
+          ls -lh "gh-hugepage-reserve-$ver.zip"
+
+      - name: Upload package zip artifact
+        uses: actions/upload-artifact@v7
+        with:
+          # archive:false uploads the single file directly (no extra zip wrapper);
+          # the artifact name is taken from the file name, so keep it versioned.
+          path: gh-hugepage-reserve-${{ steps.pkg.outputs.ver }}.zip
+          if-no-files-found: error
+          archive: false
