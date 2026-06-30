@@ -20,19 +20,22 @@ jobs:
       contents: write
     steps:
       - name: Download package zip artifact
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
+          # archive:false artifacts must be fetched by their exact name (= file name);
+          # skip-decompress keeps the .zip as-is instead of auto-extracting it.
+          name: gh-hugepage-reserve-${{ needs.build.outputs.ver }}.zip
           path: dl
-          pattern: gh-hugepage-reserve-*
-          merge-multiple: true
+          skip-decompress: true
 
       - name: Locate zip
         id: f
         run: |
           set -e
-          zip=$(find dl -name '*.zip' | head -n1)
-          if [ -z "$zip" ]; then
-            echo "::error::no packaged zip found"
+          zip="dl/gh-hugepage-reserve-${{ needs.build.outputs.ver }}.zip"
+          if [ ! -f "$zip" ]; then
+            echo "::error::no packaged zip found at $zip"
+            ls -lR dl || true
             exit 1
           fi
           echo "zip=$zip" >> "$GITHUB_OUTPUT"
@@ -42,7 +45,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }} (module v${{ needs.build.outputs.ver }})
+          name: ${{ github.ref_name }} (module ${{ needs.build.outputs.ver }})
           body: |
             gh_hugepage_reserve release.
 
