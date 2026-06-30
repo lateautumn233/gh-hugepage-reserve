@@ -22,17 +22,19 @@ jobs:
       - name: Download package zip artifact
         uses: actions/download-artifact@v7
         with:
+          # archive:false artifacts must be fetched by their exact name (= file name),
+          # not via pattern/merge-multiple.
+          name: gh-hugepage-reserve-${{ needs.build.outputs.ver }}.zip
           path: dl
-          pattern: gh-hugepage-reserve-*
-          merge-multiple: true
 
       - name: Locate zip
         id: f
         run: |
           set -e
-          zip=$(find dl -name '*.zip' | head -n1)
-          if [ -z "$zip" ]; then
-            echo "::error::no packaged zip found"
+          zip="dl/gh-hugepage-reserve-${{ needs.build.outputs.ver }}.zip"
+          if [ ! -f "$zip" ]; then
+            echo "::error::no packaged zip found at $zip"
+            ls -lR dl || true
             exit 1
           fi
           echo "zip=$zip" >> "$GITHUB_OUTPUT"
