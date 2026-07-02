@@ -1,6 +1,6 @@
 id=gh-hugepage-reserve
 name=Gunyah Hugepage Reserve
-version=v7
+version=v7.2
 versionCode=7
 author=BigfootACA & lateautumn & wasdwasd0105
 description=Kernel module for Gunyah Hugepage Reserve
