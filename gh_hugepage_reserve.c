@@ -391,14 +391,17 @@ static struct kprobe vm_destroy_kp;
 static struct kprobe free_pages_kp;
 
 /* ---- Aggressive acquire (GUI-only): alloc_contig_pages migrates to build
- *      2MB blocks even under fragmentation. alloc_contig_pages isn't exported,
- *      so resolve it via a kprobe at init. prep_compound_page is EXPORT_GPL. */
+ *      2MB blocks even under fragmentation. Neither helper is reliably exported:
+ *      alloc_contig_pages is never exported, and prep_compound_page is only
+ *      EXPORT_SYMBOL_GPL on some vendor trees (e.g. this 6.6 GKI) while merely
+ *      declared in the private mm/internal.h on others (e.g. ACK 6.1). Both are
+ *      non-static (hence in kallsyms), so resolve both via kprobe at init - a
+ *      missing export must not fail module load, only disable acquire. */
 static struct work_struct acquire_work;
 static atomic_t acquire_running = ATOMIC_INIT(0);
 static struct page *(*p_alloc_contig_pages)(unsigned long nr_pages,
 		gfp_t gfp_mask, int nid, nodemask_t *nodemask);
-/* EXPORT_SYMBOL_GPL in mm/page_alloc.c but not in a public header */
-extern void prep_compound_page(struct page *page, unsigned int order);
+static void (*p_prep_compound_page)(struct page *page, unsigned int order);
 
 /* ================================================================== */
 /*  Pool push/pop (protected by pool_lock)                            */
@@ -1113,7 +1116,7 @@ static void acquire_worker(struct work_struct *w)
 	const int nr = 1 << PAGE_ORDER;
 	int got = 0, fail_score = 0, i;
 
-	if (!p_alloc_contig_pages)
+	if (!p_alloc_contig_pages || !p_prep_compound_page)
 		goto out;
 
 	/*
@@ -1141,7 +1144,7 @@ static void acquire_worker(struct work_struct *w)
 		if (fail_score < 0)
 			fail_score = 0;
 
-		prep_compound_page(p, PAGE_ORDER);
+		p_prep_compound_page(p, PAGE_ORDER);
 		for (i = 1; i < nr; i++)
 			set_page_count(p + i, 0);	/* tails: 1 -> 0 */
 
@@ -1172,7 +1175,7 @@ static int acquire_set(const char *val, const struct kernel_param *kp)
 		atomic_set(&acquire_running, 0);
 		return 0;
 	}
-	if (!p_alloc_contig_pages)
+	if (!p_alloc_contig_pages || !p_prep_compound_page)
 		return -ENOSYS;
 	/* Nothing to do if the reserve (available + served) already meets want. */
 	if (atomic_read(&pool_count) + served_count >= READ_ONCE(pool_want))
@@ -1220,10 +1223,15 @@ static int __init hugepage_reserve_init(void)
 	INIT_WORK(&acquire_work, acquire_worker);
 	served_init();
 
-	/* Resolve the non-exported aggressive allocator (optional feature). */
+	/* Resolve the helpers the aggressive acquire path needs (optional feature).
+	 * Both are non-static but not reliably exported across kernels, so resolve
+	 * via kprobe rather than extern-linking - that way a missing/unexported
+	 * symbol only disables acquire instead of failing the whole module load. */
 	p_alloc_contig_pages = resolve_kfunc("alloc_contig_pages");
-	if (!p_alloc_contig_pages)
-		pr_warn("alloc_contig_pages not found; aggressive acquire disabled\n");
+	p_prep_compound_page = resolve_kfunc("prep_compound_page");
+	if (!p_alloc_contig_pages || !p_prep_compound_page)
+		pr_warn("aggressive acquire disabled (alloc_contig_pages=%d prep_compound_page=%d)\n",
+			!!p_alloc_contig_pages, !!p_prep_compound_page);
 
 	/* Prepare kretprobe struct */
 	kretp.handler       = ret_handler;
