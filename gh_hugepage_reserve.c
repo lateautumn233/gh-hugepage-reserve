@@ -1050,6 +1050,8 @@ MODULE_PARM_DESC(manual_refill, "Write 1 to trigger manual pool refill");
  *   shrink (new < capacity): free the excess pooled pages immediately.
  *   grow   (new > capacity): raise the target only; new pages are NOT
  *                            allocated here - use acquire to fill.
+ *   0 = soft disable: every pooled page is freed now, served pages drain
+ *   to buddy as VMs release them, and the hooks sit idle on pool_count==0.
  */
 static void pool_do_resize(int newt)
 {
@@ -1062,8 +1064,8 @@ static void pool_do_resize(int newt)
 	 * lent pages are later returned the free-hook sees pool_count >= pool_total
 	 * and lets them go to buddy instead of re-pooling - no overflow, no leak.
 	 */
-	if (newt < 1)
-		newt = 1;
+	if (newt < 0)
+		newt = 0;
 	if (newt > POOL_SIZE_MAX)
 		newt = POOL_SIZE_MAX;
 
@@ -1128,8 +1130,8 @@ static int pool_want_set(const char *val, const struct kernel_param *kp)
 
 	if (kstrtoint(val, 10, &v))
 		return -EINVAL;
-	if (v < 1)
-		v = 1;
+	if (v < 0)
+		v = 0;
 	if (v > POOL_SIZE_MAX)
 		v = POOL_SIZE_MAX;
 
@@ -1161,7 +1163,7 @@ static const struct kernel_param_ops pool_want_ops = {
 };
 module_param_cb(pool_want, &pool_want_ops, NULL, 0644);
 MODULE_PARM_DESC(pool_want,
-	"Target pages (insmod + runtime): grow raises target, shrink frees now");
+	"Target pages (insmod + runtime): grow raises target, shrink frees now, 0 soft-disables");
 
 /* ================================================================== */
 /*  Aggressive acquire (GUI-only)                                      */
@@ -1290,7 +1292,7 @@ static int __init hugepage_reserve_init(void)
 {
 	int i, ret;
 
-	if (pool_want < 1 || pool_want > POOL_SIZE_MAX)
+	if (pool_want < 0 || pool_want > POOL_SIZE_MAX)
 		pool_want = 1024;
 
 	if (refill_delay_ms < 1000)
@@ -1349,10 +1351,15 @@ static int __init hugepage_reserve_init(void)
 	/* pool_want stays = the requested target (may exceed capacity) */
 	atomic_set(&pool_count, pool_total);
 
-	if (pool_total == 0) {
-		pr_err("no pages allocated, aborting\n");
-		return -ENOMEM;
-	}
+	/*
+	 * An empty pool is a valid load state (boot-time memory too fragmented,
+	 * or pool_want=0 soft-disable): the hooks stay armed but idle while
+	 * pool_count is 0, and capacity grows later via acquire (or a pool_want
+	 * write followed by acquire).
+	 */
+	if (pool_total == 0 && pool_want > 0)
+		pr_warn("started empty; grow via acquire toward target %d\n",
+			pool_want);
 
 	pr_info("pool ready: %d x 2MB = %d MB (target %d)\n",
 		pool_total, pool_total * 2, pool_want);
