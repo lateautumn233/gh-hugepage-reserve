@@ -1,8 +1,8 @@
 id=gh-hugepage-reserve
 name=Gunyah Hugepage Reserve
-version=v7
-versionCode=7
-author=BigfootACA & lateautumn & wasdwasd0105
+version=v8
+versionCode=8
+author=BigfootACA & lateautumn & wasdwasd0105 & HuJK
 description=Kernel module for Gunyah Hugepage Reserve
 updateJson=https://api.classfun.cn/gh-hugepage-reserve/update/
 support=https://github.com/Droid-VM/gh-hugepage-reserve

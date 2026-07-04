@@ -21,8 +21,14 @@
  *   3. VM lifecycle tracking (kprobes):
  *      - Creation:    kprobe on gunyah_dev_vm_mgr_ioctl (GH_CREATE_VM)
  *                     records the caller's mm_struct for filtering.
+ *                     Each owner carries a vm_count (VMs created by that mm).
  *      - Destruction: kprobe on gunyah_vm_release / gh_vm_free
- *                     schedules delayed pool refill after VM exits.
+ *                     schedules delayed pool refill after VM exits, then
+ *                     sweeps owners per-entry: only those whose process is
+ *                     dead (mm_users == 0) or whose last VM was closed are
+ *                     released. Sibling VMs keep their tracking - one VM
+ *                     dying (e.g. OOM kill of one crosvm) must never drop
+ *                     the others.
  *
  *   4. Pool refill (delayed work):
  *      After VM shutdown + configurable delay, refills pool from buddy
@@ -107,7 +113,6 @@ static DEFINE_MUTEX(hook_mutex);
 enum refill_state { REFILL_IDLE = 0, REFILL_WAITING, REFILL_RUNNING };
 
 static atomic_t refill_status = ATOMIC_INIT(REFILL_IDLE);
-static atomic_t vm_active_count = ATOMIC_INIT(0);
 static atomic_t total_served = ATOMIC_INIT(0);
 static atomic_t total_refilled = ATOMIC_INIT(0);
 
@@ -120,52 +125,93 @@ static atomic_t total_refilled = ATOMIC_INIT(0);
  *
  * The kretprobe on __alloc_pages checks current->mm against this set
  * to avoid serving pool pages to unrelated order-9 allocations.
+ *
+ * Owners are released one at a time by the sweep worker, and only when
+ * they are actually gone: process dead (mm_users == 0) or last VM closed
+ * (vm_count == 0). Never clear the whole table on a destroy event - with
+ * several VM processes, one dying (e.g. OOM kill) must not drop the
+ * tracking of the survivors.
+ *
+ * Slots are reused in place (mm == NULL marks a free slot) so the
+ * lockless readers never see entries move; vm_owner_count is the
+ * high-water slot count.
  */
 #define VM_OWNER_MAX	8
 
 /*
  * One tracked Gunyah VM owner. tgid/comm are captured at GH_CREATE_VM time
  * so userspace can attribute pool pages to a concrete process (and, in the
- * app, to a VM). served counts the pool pages actually handed to this owner.
+ * app, to a VM). served counts the pool pages actually handed to this owner;
+ * vm_count is the number of VMs this mm has created and not yet destroyed.
  */
 struct vm_owner {
 	struct mm_struct *mm;
 	pid_t		  tgid;
 	char		  comm[TASK_COMM_LEN];
 	atomic_t	  served;
+	int		  vm_count;
 };
 
 static struct vm_owner vm_owners[VM_OWNER_MAX];
 static atomic_t vm_owner_count = ATOMIC_INIT(0);
 static DEFINE_SPINLOCK(vm_owner_lock);
+static struct work_struct vm_owner_sweep_work;
 
 static void vm_owner_add(struct mm_struct *mm)
+{
+	unsigned long flags;
+	int i, count, slot = -1;
+
+	spin_lock_irqsave(&vm_owner_lock, flags);
+	count = atomic_read(&vm_owner_count);
+
+	for (i = 0; i < count; i++) {
+		if (vm_owners[i].mm == mm) {
+			vm_owners[i].vm_count++;
+			goto out;
+		}
+		if (!vm_owners[i].mm && slot < 0)
+			slot = i;	/* swept slot: reusable */
+	}
+	if (slot < 0 && count < VM_OWNER_MAX)
+		slot = count;
+	if (slot >= 0) {
+		mmgrab(mm);
+		vm_owners[slot].tgid = current->tgid;
+		strscpy(vm_owners[slot].comm, current->comm,
+			sizeof(vm_owners[slot].comm));
+		atomic_set(&vm_owners[slot].served, 0);
+		vm_owners[slot].vm_count = 1;
+		/* mm gates the entry for lockless readers: publish it last */
+		smp_store_release(&vm_owners[slot].mm, mm);
+		if (slot == count)
+			smp_store_release(&vm_owner_count.counter, count + 1);
+		pr_info("tracking VM owner mm=%px pid=%d (comm=%s)\n",
+			mm, current->tgid, current->comm);
+	} else {
+		pr_warn("too many VM owners (%d), ignoring %s\n",
+			VM_OWNER_MAX, current->comm);
+		schedule_work(&vm_owner_sweep_work);
+	}
+out:
+	spin_unlock_irqrestore(&vm_owner_lock, flags);
+}
+
+/* Drop one VM from the owner matching @mm (explicit close by a live process). */
+static void vm_owner_vm_dec(struct mm_struct *mm)
 {
 	unsigned long flags;
 	int i, count;
 
 	spin_lock_irqsave(&vm_owner_lock, flags);
 	count = atomic_read(&vm_owner_count);
-
 	for (i = 0; i < count; i++) {
-		if (vm_owners[i].mm == mm)
-			goto out;
+		if (vm_owners[i].mm == mm) {
+			if (vm_owners[i].vm_count > 0)
+				vm_owners[i].vm_count--;
+			break;
+		}
 	}
-	if (count < VM_OWNER_MAX) {
-		mmgrab(mm);
-		vm_owners[count].mm = mm;
-		vm_owners[count].tgid = current->tgid;
-		strscpy(vm_owners[count].comm, current->comm,
-			sizeof(vm_owners[count].comm));
-		atomic_set(&vm_owners[count].served, 0);
-		smp_store_release(&vm_owner_count.counter, count + 1);
-		pr_info("tracking VM owner mm=%px pid=%d (comm=%s)\n",
-			mm, current->tgid, current->comm);
-	} else {
-		pr_warn("too many VM owners (%d), ignoring %s\n",
-			VM_OWNER_MAX, current->comm);
-	}
-out:
 	spin_unlock_irqrestore(&vm_owner_lock, flags);
 }
 
@@ -193,6 +239,19 @@ static void vm_owner_served_inc(struct mm_struct *mm)
 			return;
 		}
 	}
+}
+
+/* Live VMs = sum of per-owner vm_count (lockless, for stats/logs). */
+static int vm_active_total(void)
+{
+	int i, count, total = 0;
+
+	count = smp_load_acquire(&vm_owner_count.counter);
+	for (i = 0; i < count; i++) {
+		if (READ_ONCE(vm_owners[i].mm))
+			total += READ_ONCE(vm_owners[i].vm_count);
+	}
+	return total;
 }
 
 /* ================================================================== */
@@ -316,13 +375,20 @@ static void served_do_reconcile(void)
 	int   live = 0, of = 0, oi = 0;
 
 	spin_lock_irqsave(&vm_owner_lock, flags);
-	live_n = atomic_read(&vm_owner_count);
-	if (live_n > VM_OWNER_MAX)
-		live_n = VM_OWNER_MAX;
-	for (i = 0; i < live_n; i++) {
-		live_tgid[i] = vm_owners[i].tgid;
-		strscpy(live_comm[i], vm_owners[i].comm, TASK_COMM_LEN);
-		live_pages[i] = 0;
+	{
+		int count = atomic_read(&vm_owner_count);
+
+		if (count > VM_OWNER_MAX)
+			count = VM_OWNER_MAX;
+		live_n = 0;
+		for (i = 0; i < count; i++) {
+			if (!vm_owners[i].mm)
+				continue;	/* swept slot */
+			live_tgid[live_n] = vm_owners[i].tgid;
+			strscpy(live_comm[live_n], vm_owners[i].comm, TASK_COMM_LEN);
+			live_pages[live_n] = 0;
+			live_n++;
+		}
 	}
 	spin_unlock_irqrestore(&vm_owner_lock, flags);
 
@@ -383,7 +449,6 @@ static void served_do_reconcile(void)
 
 /* ---- Work and probe structs ---- */
 
-static struct work_struct vm_owner_release_work;
 static struct delayed_work refill_work;
 static struct kretprobe kretp;
 static struct kprobe vm_detect_kp;
@@ -565,13 +630,11 @@ static int vm_detect_pre_handler(struct kprobe *p, struct pt_regs *regs)
 	if (cmd != GH_CREATE_VM)
 		return 0;
 
-	atomic_inc(&vm_active_count);
-
 	if (current->mm)
 		vm_owner_add(current->mm);
 
 	pr_info("VM creation detected (active=%d, comm=%s)\n",
-		atomic_read(&vm_active_count), current->comm);
+		vm_active_total(), current->comm);
 	return 0;
 }
 
@@ -581,22 +644,24 @@ static int vm_detect_pre_handler(struct kprobe *p, struct pt_regs *regs)
 
 static int vm_destroy_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
-	int active;
-
 	/*
-	 * Filter: only handle tracked VM owners.
+	 * Filter: only handle tracked VM owners. On the process-exit path
+	 * (OOM kill, crash) current->mm is already NULL by the time the fd
+	 * is released (exit_mm runs before exit_files), so accept mm==NULL
+	 * whenever anyone is tracked - the sweep identifies which owner
+	 * actually died via mm_users, not via current.
 	 */
 	if (current->mm && !vm_owner_contains(current->mm))
 		return 0;
 	if (!current->mm && atomic_read(&vm_owner_count) == 0)
 		return 0;
 
-	active = atomic_dec_return(&vm_active_count);
-	if (active < 0)
-		atomic_set(&vm_active_count, 0);
+	/* Explicit close by a live tracked process: drop one VM from it */
+	if (current->mm)
+		vm_owner_vm_dec(current->mm);
 
 	pr_info("VM destruction detected (active=%d, pool=%d/%d, comm=%s)\n",
-		max(active, 0), atomic_read(&pool_count), pool_total,
+		vm_active_total(), atomic_read(&pool_count), pool_total,
 		current->comm);
 
 	/* Schedule refill immediately - worker polls mm_users before allocating */
@@ -605,8 +670,8 @@ static int vm_destroy_pre_handler(struct kprobe *p, struct pt_regs *regs)
 		schedule_delayed_work(&refill_work, 0);
 		pr_info("refill scheduled\n");
 	} else {
-		/* Pool full or refill already running - release mms now */
-		schedule_work(&vm_owner_release_work);
+		/* Pool full or refill already running - sweep dead owners now */
+		schedule_work(&vm_owner_sweep_work);
 	}
 
 	return 0;
@@ -639,26 +704,42 @@ static int register_kretp_with_fallback(void)
 	return ret;
 }
 
-/* Release all tracked VM owner mm_structs (deferred - mmdrop may sleep) */
-static void vm_owner_release_worker(struct work_struct *work)
+/*
+ * Sweep tracked owners, releasing only those that are gone: process dead
+ * (mm_users == 0) or last VM closed (vm_count == 0). Owners with live VMs
+ * are left untouched, so one VM dying never drops the tracking of the
+ * others. Deferred to a worker because mmdrop may sleep.
+ */
+static void vm_owner_sweep_worker(struct work_struct *work)
 {
 	unsigned long flags;
 	struct mm_struct *to_drop[VM_OWNER_MAX];
-	int i, count;
+	int i, count, ndrop = 0;
 
 	spin_lock_irqsave(&vm_owner_lock, flags);
 	count = atomic_read(&vm_owner_count);
 	for (i = 0; i < count; i++) {
-		to_drop[i] = vm_owners[i].mm;
-		vm_owners[i].mm = NULL;
+		struct mm_struct *mm = vm_owners[i].mm;
+
+		if (!mm)
+			continue;
+		if (vm_owners[i].vm_count > 0 &&
+		    atomic_read(&mm->mm_users) > 0)
+			continue;	/* live owner: keep tracking */
+		to_drop[ndrop++] = mm;
+		WRITE_ONCE(vm_owners[i].mm, NULL);
 		vm_owners[i].tgid = 0;
 		vm_owners[i].comm[0] = '\0';
 		atomic_set(&vm_owners[i].served, 0);
+		vm_owners[i].vm_count = 0;
 	}
-	atomic_set(&vm_owner_count, 0);
+	/* Trim trailing free slots so count==0 again means "nobody tracked" */
+	while (count > 0 && !vm_owners[count - 1].mm)
+		count--;
+	smp_store_release(&vm_owner_count.counter, count);
 	spin_unlock_irqrestore(&vm_owner_lock, flags);
 
-	for (i = 0; i < count; i++) {
+	for (i = 0; i < ndrop; i++) {
 		pr_info("releasing VM owner mm=%px\n",
 			to_drop[i]);
 		mmdrop(to_drop[i]);
@@ -769,8 +850,8 @@ static void refill_worker(struct work_struct *work)
 	pr_info("refill complete: %d pages recovered, pool %d/%d\n",
 		total_allocated, atomic_read(&pool_count), pool_total);
 
-	/* Release tracked mms - clean state for next VM cycle */
-	schedule_work(&vm_owner_release_work);
+	/* Sweep owners whose process/VMs are gone - survivors keep tracking */
+	schedule_work(&vm_owner_sweep_work);
 
 	atomic_set(&refill_status, REFILL_IDLE);
 }
@@ -850,7 +931,7 @@ static int refill_stat_get(char *buf, const struct kernel_param *kp)
 	n += sysfs_emit_at(buf, n, "pool_want=%d\n", READ_ONCE(pool_want));
 	n += sysfs_emit_at(buf, n, "total_served=%d\n", atomic_read(&total_served));
 	n += sysfs_emit_at(buf, n, "total_refilled=%d\n", atomic_read(&total_refilled));
-	n += sysfs_emit_at(buf, n, "active_vms=%d\n", max(atomic_read(&vm_active_count), 0));
+	n += sysfs_emit_at(buf, n, "active_vms=%d\n", vm_active_total());
 	n += sysfs_emit_at(buf, n, "acquire_active=%d\n", atomic_read(&acquire_running));
 
 	return n;
@@ -969,6 +1050,8 @@ MODULE_PARM_DESC(manual_refill, "Write 1 to trigger manual pool refill");
  *   shrink (new < capacity): free the excess pooled pages immediately.
  *   grow   (new > capacity): raise the target only; new pages are NOT
  *                            allocated here - use acquire to fill.
+ *   0 = soft disable: every pooled page is freed now, served pages drain
+ *   to buddy as VMs release them, and the hooks sit idle on pool_count==0.
  */
 static void pool_do_resize(int newt)
 {
@@ -981,8 +1064,8 @@ static void pool_do_resize(int newt)
 	 * lent pages are later returned the free-hook sees pool_count >= pool_total
 	 * and lets them go to buddy instead of re-pooling - no overflow, no leak.
 	 */
-	if (newt < 1)
-		newt = 1;
+	if (newt < 0)
+		newt = 0;
 	if (newt > POOL_SIZE_MAX)
 		newt = POOL_SIZE_MAX;
 
@@ -1047,8 +1130,8 @@ static int pool_want_set(const char *val, const struct kernel_param *kp)
 
 	if (kstrtoint(val, 10, &v))
 		return -EINVAL;
-	if (v < 1)
-		v = 1;
+	if (v < 0)
+		v = 0;
 	if (v > POOL_SIZE_MAX)
 		v = POOL_SIZE_MAX;
 
@@ -1080,7 +1163,7 @@ static const struct kernel_param_ops pool_want_ops = {
 };
 module_param_cb(pool_want, &pool_want_ops, NULL, 0644);
 MODULE_PARM_DESC(pool_want,
-	"Target pages (insmod + runtime): grow raises target, shrink frees now");
+	"Target pages (insmod + runtime): grow raises target, shrink frees now, 0 soft-disables");
 
 /* ================================================================== */
 /*  Aggressive acquire (GUI-only)                                      */
@@ -1209,7 +1292,7 @@ static int __init hugepage_reserve_init(void)
 {
 	int i, ret;
 
-	if (pool_want < 1 || pool_want > POOL_SIZE_MAX)
+	if (pool_want < 0 || pool_want > POOL_SIZE_MAX)
 		pool_want = 1024;
 
 	if (refill_delay_ms < 1000)
@@ -1218,7 +1301,7 @@ static int __init hugepage_reserve_init(void)
 	pr_info("allocating up to %d x 2MB = %d MB\n",
 		pool_want, pool_want * 2);
 
-	INIT_WORK(&vm_owner_release_work, vm_owner_release_worker);
+	INIT_WORK(&vm_owner_sweep_work, vm_owner_sweep_worker);
 	INIT_DELAYED_WORK(&refill_work, refill_worker);
 	INIT_WORK(&acquire_work, acquire_worker);
 	served_init();
@@ -1226,8 +1309,14 @@ static int __init hugepage_reserve_init(void)
 	/* Resolve the helpers the aggressive acquire path needs (optional feature).
 	 * Both are non-static but not reliably exported across kernels, so resolve
 	 * via kprobe rather than extern-linking - that way a missing/unexported
-	 * symbol only disables acquire instead of failing the whole module load. */
-	p_alloc_contig_pages = resolve_kfunc("alloc_contig_pages");
+	 * symbol only disables acquire instead of failing the whole module load.
+	 * Since 6.10 mem-alloc-profiling renamed the real function to
+	 * alloc_contig_pages_noprof (same signature; the old name is now a macro),
+	 * so try the _noprof variant first - same dance as the __alloc_pages
+	 * kretprobe fallback list. */
+	p_alloc_contig_pages = resolve_kfunc("alloc_contig_pages_noprof");
+	if (!p_alloc_contig_pages)
+		p_alloc_contig_pages = resolve_kfunc("alloc_contig_pages");
 	p_prep_compound_page = resolve_kfunc("prep_compound_page");
 	if (!p_alloc_contig_pages || !p_prep_compound_page)
 		pr_warn("aggressive acquire disabled (alloc_contig_pages=%d prep_compound_page=%d)\n",
@@ -1262,10 +1351,15 @@ static int __init hugepage_reserve_init(void)
 	/* pool_want stays = the requested target (may exceed capacity) */
 	atomic_set(&pool_count, pool_total);
 
-	if (pool_total == 0) {
-		pr_err("no pages allocated, aborting\n");
-		return -ENOMEM;
-	}
+	/*
+	 * An empty pool is a valid load state (boot-time memory too fragmented,
+	 * or pool_want=0 soft-disable): the hooks stay armed but idle while
+	 * pool_count is 0, and capacity grows later via acquire (or a pool_want
+	 * write followed by acquire).
+	 */
+	if (pool_total == 0 && pool_want > 0)
+		pr_warn("started empty; grow via acquire toward target %d\n",
+			pool_want);
 
 	pr_info("pool ready: %d x 2MB = %d MB (target %d)\n",
 		pool_total, pool_total * 2, pool_want);
@@ -1365,7 +1459,7 @@ static void __exit hugepage_reserve_exit(void)
 	WRITE_ONCE(pool_ready, false);
 
 	/* Cancel all pending work */
-	cancel_work_sync(&vm_owner_release_work);
+	cancel_work_sync(&vm_owner_sweep_work);
 	cancel_work_sync(&acquire_work);
 	cancel_delayed_work_sync(&refill_work);
 
