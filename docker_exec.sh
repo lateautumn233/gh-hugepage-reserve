@@ -8,6 +8,11 @@ export PATH="${CLANG_DIR}/bin:${PATH}"
 FAIL=0
 BUILD_DIR="/tmp/build"
 mkdir -p "$BUILD_DIR"
+# ABI single-source header (generated from abi/kapi_abi.tsv); #include'd by the
+# module so it and the userspace preflight share one symbol/signature definition.
+if [ -f /src/abi/kapi_abi.gen.h ]; then
+    cp /src/abi/kapi_abi.gen.h "${BUILD_DIR}/kapi_abi.gen.h"
+fi
 MAKEFILE_CONTENT=""
 for ENTRY in "$@"; do
     SRC_FILE="${ENTRY%%:*}"

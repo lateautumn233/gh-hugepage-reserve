@@ -26,6 +26,14 @@ fi
 
 rm -f "${TOP_DIR}/package/ko/"*/*.ko
 
+# Regenerate the ABI single-source header from the TSV so the .ko (compiled in)
+# and the userspace preflight (abi/kapi_check) share one definition. See abi/.
+if command -v awk >/dev/null 2>&1 && [ -f "${TOP_DIR}/abi/gen_kapi.awk" ]; then
+	awk -f "${TOP_DIR}/abi/gen_kapi.awk" "${TOP_DIR}/abi/kapi_abi.tsv" \
+		> "${TOP_DIR}/abi/kapi_abi.gen.h"
+	echo "generated abi/kapi_abi.gen.h"
+fi
+
 for TAG in "${TAGS[@]}"; do
 	echo "============================================"
 	echo "  Building all modules for ${TAG}"

@@ -1,5 +1,8 @@
 *.zip
 *.ko
+# compiled ABI preflight binaries (source + generated header ARE tracked)
+/abi/kapi_check
+/abi/kapi_check.arm64
 .DS_Store
 /.idea
 /.vscode

@@ -44,6 +44,9 @@ done
 cp -v module.prop "$DSTDIR/"
 cp -av module/* "$DSTDIR/"
 chmod +x "$DSTDIR/"*.sh
+# ABI preflight helper (aarch64 static), if shipped: make it executable so
+# post-fs-data.sh can run it. Absent -> post-fs-data fail-opens (no preflight).
+[ -f "$DSTDIR/kapi_check" ] && chmod +x "$DSTDIR/kapi_check"
 cp -a "$DSTDIR" "/data/adb/modules/"
 echo
 echo -e "\xe2\x9c\x85 Module installed successfully. Please reboot to take effect."
