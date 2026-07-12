@@ -200,7 +200,7 @@ target).
 
 ---
 
-## 4. CMA reservoir (v10, experimental) - give idle reserve back to apps
+## 4. CMA reservoir (v10/v11, experimental) - give idle reserve back to apps
 
 With `pool_want_with_cma > pool_want`, the difference is kept as a **CMA
 reservoir**: whole pageblocks the module labels `MIGRATE_CMA` and leaves *free
@@ -227,6 +227,32 @@ elastic loop. Writing `pool_want_with_cma` smaller demolishes the excess
 reservoir immediately (emptiest blocks first); writing `0` demolishes all of
 it. `rmmod` restores every block to `MOVABLE` before the pool is freed.
 
+**Consuming the reservoir (v11).** The claim above - "app movable allocations
+use that memory like any other" - only holds when the kernel actually routes
+plain movable allocations into CMA. A stock `restrict_cma_redirect=true` kernel
+does not: only `__GFP_CMA`-tagged allocations (small anon faults, swap-in) reach
+the CMA freelist, while the app's real working set - page cache and mTHP anon -
+carries no `__GFP_CMA` and never touches the reservoir, leaving it idle. Two
+`moveable_to_cma_*` levers open that path; both are off by default, gated behind
+the CMA feature, and inert when the vendor already opens it:
+
+- `moveable_to_cma_gfp_cma_hook` (surgical, preferred): a vendor-hook probe that
+  ORs `ALLOC_CMA` into plain movable requests, self-limited to *reservoir full*
+  plus a `cma_bypass_floor_mb` free-CMA floor (default 256 MB) so it can neither
+  race acquire nor drain CMA to exhaustion. Located by name
+  (`android_vh_alloc_flags_cma_adjust` on 6.1/6.6, `android_vh_calc_alloc_flags`
+  on 6.12) - only *our* reservoir's intake widens, vendor CMA balancing is left
+  alone.
+- `moveable_to_cma_restrict_cma_redirect_disabled` (global): flips the kernel's
+  `restrict_cma_redirect` static key off, making *all* movable eligible for
+  *all* CMA (vendor carveouts included) - heavier, process-context only, and it
+  drains pcp after the flip for the 6.6/6.12 `cma_has_pcplist` overload. Value is
+  the outcome: `1` = redirect on (movable can migrate in), `0` = blocked.
+
+`moveable_to_cma_vender_already_allowed` (RO) reports `1` when the vendor kernel
+already redirects movable -> CMA (`restrict_cma_redirect` resolved and false); a
+lever write is then a no-op and the disabled-lever read still shows `1`.
+
 ---
 
 ## Parameter reference
@@ -247,6 +273,10 @@ All under `/sys/module/gh_hugepage_reserve/parameters/`.
 | `acquire_mem_floor_mb` | 0600 | acquire | Sweep stops below this `MemAvailable` (default 512) |
 | `pool_want_with_cma`   | 0600 | cma     | Total target incl. reservoir (pages); `0` = off     |
 | `cma_reservoir_floor_mb` | 0600 | cma   | Refuse flips below this non-CMA available (MB)      |
+| `moveable_to_cma_gfp_cma_hook` | 0600 | cma | Arm `__GFP_CMA` bypass so page cache / mTHP anon consume the reservoir |
+| `cma_bypass_floor_mb`  | 0600 | cma     | Bypass hook stops granting CMA below this free-CMA (MB, default 256) |
+| `moveable_to_cma_restrict_cma_redirect_disabled` | 0600 | cma | Global movable→CMA: `1` = on, `0` = blocked (flips restrict key) |
+| `moveable_to_cma_vender_already_allowed` | 0400 | cma | RO: `1` = vendor kernel already redirects movable→CMA |
 | `migrate_cma_val`      | 0400 | cma     | `MIGRATE_CMA` value from preflight; `-1` = off      |
 | `pageblock_order_val`  | 0400 | cma     | Pageblock order from preflight; `-1` = off          |
 | `pool_cma`             | 0400 | cma     | Reservoir size (2 MB-page equivalents), read-only   |

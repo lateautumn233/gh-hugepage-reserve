@@ -51,24 +51,31 @@ fi
 # or unreadable -> -1 -> the module keeps the reservoir off (v9 path).
 PB_ORDER="$(sed -n 's/^Page block order:[[:space:]]*//p' /proc/pagetypeinfo 2>/dev/null | head -n1)"
 WCMA="${pool_want_with_cma:-0}"		# from settings.prop; 0 = no reservoir
-# cma_probe_result=0 in settings.prop = the app's balloon probe found apps
-# cannot consume CMA on this kernel: hand the module -1 preflight values so
-# the whole CMA side stays cold (no boot verification, no seed blocks - the
-# module is exactly v9). Any other value (unset/1) leaves it capability-based.
-if [ "${cma_probe_result:-}" = "0" ]; then
-	V10_ARGS="migrate_cma_val=-1 pageblock_order_val=-1 pool_want_with_cma=0"
-else
-	V10_ARGS="migrate_cma_val=${MIGRATE_CMA:--1} pageblock_order_val=${PB_ORDER:--1} pool_want_with_cma=${WCMA}"
-fi
+V10_ARGS="migrate_cma_val=${MIGRATE_CMA:--1} pageblock_order_val=${PB_ORDER:--1} pool_want_with_cma=${WCMA}"
 echo "v10 args: $V10_ARGS"
+
+# v11 movable->CMA lever: the DroidVM app records the user's saved choice in
+# cma_movable_lever (hook|flag). Re-apply it at insmod so a reservoir the user
+# chose to keep is actually consumable by apps after a reboot - without this the
+# reservoir rebuilds but nothing arms the movable->CMA redirect, so it sits idle.
+# Absent = no lever (Module CMA only). The module records the desire at insmod
+# and arms it in cma_boot_build; it is a no-op when the vendor already redirects.
+MTC_ARG=""
+case "${cma_movable_lever:-}" in
+	hook) MTC_ARG="moveable_to_cma_gfp_cma_hook=1" ;;
+	flag) MTC_ARG="moveable_to_cma_restrict_cma_redirect_disabled=1" ;;
+esac
+[ -n "$MTC_ARG" ] && echo "mtc lever: $MTC_ARG"
 
 # Pass BOTH size params first: a lenient kernel silently ignores the one the
 # module lacks, so it still gets SZ via pool_want (v7) or pool_target (v6).
-# Strict kernels reject an unknown param, so fall back to each key alone. Try
-# the full v10 set first, then WITHOUT the v10 params so an older .ko still
-# loads, then without the ABI guard for a .ko that predates disable_kapi, then
-# a bare (default-size) load.
-insmod "$KO" $DIS_ARG pool_want="$SZ" pool_target="$SZ" $V10_ARGS ||
+# Strict kernels reject an unknown param, so fall back progressively: the full
+# v11 set (v10 args + lever), then v10 without the lever (older .ko lacking the
+# moveable_to_cma_* params), then without the v10 params at all, then without the
+# ABI guard for a .ko predating disable_kapi, then a bare (default-size) load.
+insmod "$KO" $DIS_ARG pool_want="$SZ" pool_target="$SZ" $V10_ARGS $MTC_ARG ||
+	insmod "$KO" $DIS_ARG pool_want="$SZ" $V10_ARGS $MTC_ARG ||
+	insmod "$KO" $DIS_ARG pool_want="$SZ" pool_target="$SZ" $V10_ARGS ||
 	insmod "$KO" $DIS_ARG pool_want="$SZ" $V10_ARGS ||
 	insmod "$KO" $DIS_ARG pool_want="$SZ" pool_target="$SZ" ||
 	insmod "$KO" $DIS_ARG pool_want="$SZ" ||

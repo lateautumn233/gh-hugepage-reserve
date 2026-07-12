@@ -52,3 +52,19 @@ mem_cgroup_from_task	*	*	func	mem_cgroup*	task_struct*	A
 try_to_free_mem_cgroup_pages	*	6.12.0	func	ulong	mem_cgroup*,ulong,uint,uint	A
 try_to_free_mem_cgroup_pages	6.12.0	*	func	ulong	mem_cgroup*,ulong,uint,uint,int*	A
 android_vh_free_one_page_bypass	*	*	hook	void	page*,zone*,int,int,int,bool*	hook
+# moveable_to_cma levers. static_key_enable/disable + kallsyms_lookup_name back
+# the restrict_cma_redirect flip (stable signatures, all versions). The two gfp
+# adjust hooks are ABI-era exclusive: android_vh_alloc_flags_cma_adjust on
+# [6.1,6.12) (called after the built-in ALLOC_CMA decision), replaced by
+# android_vh_calc_alloc_flags on [6.12,*) (3-arg, called before). At most one
+# exists per kernel; the module registers whichever it finds by name. Like every
+# hook they are not BTF-checkable (no btf_trace typedef) so never auto-disabled.
+# NOTE: the restrict_cma_redirect DATA symbol itself is intentionally absent -
+# it has no call signature / btf_trace typedef, so a row would make the preflight
+# hunt a FUNC that isn't there and falsely disable the lever; it is resolved by
+# kallsyms_lookup_name at runtime instead.
+static_key_enable	*	*	func	void	static_key*	mtc
+static_key_disable	*	*	func	void	static_key*	mtc
+kallsyms_lookup_name	*	*	func	ulong	char*	mtc
+android_vh_alloc_flags_cma_adjust	*	6.12.0	hook	void	uint,uint*	mtc
+android_vh_calc_alloc_flags	6.12.0	*	hook	void	uint,uint*,bool*	mtc
