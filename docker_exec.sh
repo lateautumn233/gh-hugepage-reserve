@@ -21,6 +21,13 @@ for ENTRY in "$@"; do
 "
     cp "/src/${SRC_FILE}" "${BUILD_DIR}/${MOD_NAME}.c"
 done
+# Unity-build parts: the module source #includes parts/*.c.inc, so copy that dir
+# next to it for the include path to resolve. The .inc are NOT compiled
+# separately (only *.o in obj-m are), just textually included by the module .c.
+if [ -d /src/parts ]; then
+    mkdir -p "${BUILD_DIR}/parts"
+    cp /src/parts/* "${BUILD_DIR}/parts/"
+fi
 printf '%s' "$MAKEFILE_CONTENT" > "${BUILD_DIR}/Makefile"
 if make -C "${KDIR}" -j "$(nproc)" M="${BUILD_DIR}" ARCH=arm64 LLVM=1 LLVM_IAS=1 modules; then
     for ENTRY in "$@"; do
