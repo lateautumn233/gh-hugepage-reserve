@@ -881,14 +881,12 @@ static int cma_sweep_window_to_reservoir(unsigned long win)
 	if (READ_ONCE(limbo_n) < cma_limbo_intake_cap()) {
 		struct page *head = pfn_to_page(win);
 
-		rebuild_order9_compound(head);
-		if (limbo_add(head)) {
+		if (limbo_add_rebuild_order9(head)) {
 			pb_track(win, PB_LIMBO, 0);
 			mutex_unlock(&cma_mutex);
 			return 0;
 		}
-		/* raced full: back to singles and out */
-		cma_span_make_singles(win, 1UL << PAGE_ORDER);
+		/* raced full: page is still singles-held, free it unchanged */
 	}
 	mutex_unlock(&cma_mutex);
 	cma_span_free_to_buddy(win, 1UL << PAGE_ORDER);

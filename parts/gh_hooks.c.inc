@@ -38,6 +38,26 @@ static void rebuild_order9_compound(struct page *head)
 		set_page_count(head + i, 0);	/* tails: rebuild as 0 */
 }
 
+/* Add a singles-held window to limbo without exposing a half-converted page.
+ * If the slot disappeared, leave the window untouched for its caller's
+ * existing singles free path. */
+static bool limbo_add_rebuild_order9(struct page *page)
+{
+	unsigned long flags;
+	bool ok = false;
+
+	raw_spin_lock_irqsave(&limbo_lock, flags);
+	if (limbo_n < LIMBO_MAX) {
+		rebuild_order9_compound(page);
+		limbo_pages[limbo_n] = page;
+		limbo_age[limbo_n] = 0;
+		limbo_n++;
+		ok = true;
+	}
+	raw_spin_unlock_irqrestore(&limbo_lock, flags);
+	return ok;
+}
+
 /*
  * Re-pool a page the free-path is about to hand to the buddy allocator.
  * free_pages_prepare has already run: the compound is torn down, refcount is
